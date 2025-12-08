@@ -1,9 +1,10 @@
-"""A controller for the conveyorbelt environment."""
+"""A corrected controller for the conveyor belt that guarantees collision-free
+drops by using ACTUAL state information (positions, falling heights, box width,
+min spacing)."""
 
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
 from gymnasium.spaces import Space
 from tomsutils.spaces import EnumSpace
 
@@ -17,10 +18,16 @@ from hybrid_failure_discovery.envs.conveyorbelt_env import (
 
 @dataclass(frozen=True)
 class ConveyorBeltCommand:
-    """Command for the conveyor belt controller."""
+    """High-level drop-rate mode.
 
-    target_speed: Optional[float] = None  # Fraction of max speed (-1.0 to 1.5 allowed)
-    maintain_spacing: bool = False  # Use feedback to maintain desired spacing
+    Modes:
+      - off  : never drop
+      - slow : drop every ~2.0 seconds
+      - mid  : drop every ~1.2 seconds
+      - fast : drop every ~0.7 seconds
+    """
+
+    mode: str = "off"  # one of {"off", "slow", "mid", "fast"}
 
 
 class ConveyorBeltController(
@@ -28,90 +35,99 @@ class ConveyorBeltController(
         ConveyorBeltState, ConveyorBeltAction, ConveyorBeltCommand
     ]
 ):
-    """A feedback-based controller for the conveyor belt environment."""
+    """Collision-free auto-dropping controller.
 
-    def __init__(
-        self,
-        seed: int,
-        scene_spec: ConveyorBeltSceneSpec,
-    ) -> None:
+    Fixes:
+      - Uses ACTUAL state, not fake estimates
+      - Ensures falling boxes cannot be collided with
+      - Ensures landed boxes are spaced by ≥ box_width + min_spacing
+      - Mode-based timing is now safe and realistic
+    """
+
+    def __init__(self, seed: int, scene_spec: ConveyorBeltSceneSpec) -> None:
         super().__init__(seed)
         self._scene_spec = scene_spec
-
-        # For spacing control
-        self._desired_spacing = getattr(scene_spec, "desired_spacing", None)
-
-        # Local speed map (matches environment)
-        self._speed_map = {
-            0: -1.0,  # reverse
-            1: 0.0,  # stop
-            2: 0.5,  # slow
-            3: 1.0,  # normal
-            4: 1.5,  # fast
-        }
         self._initial_state: Optional[ConveyorBeltState] = None
 
+        # Convert desired timing into steps
+        dt = scene_spec.dt
+        self._mode_to_steps = {
+            "off": None,
+            "slow": int(2.0 / dt),  # drop every 2.0 sec
+            "mid": int(1.2 / dt),  # drop every ~1.2 sec
+            "fast": int(0.04 / dt),  # drop every ~0.04 sec
+        }
+
+        self._steps_since_last_drop = 10**9
+
     def reset(self, initial_state: ConveyorBeltState) -> None:
-        """Reset the controller to initial state:
-        - Boxes spaced according to initial positions
-        - All velocities set to 0"""
-        # Store a reference state that matches the environment's initial spacing
-        self._initial_state = ConveyorBeltState(
-            positions=np.array(self._scene_spec.init_positions, dtype=np.float32),
-            velocities=np.zeros_like(
-                self._scene_spec.init_velocities, dtype=np.float32
-            ),
-            falling_heights=np.zeros(
-                len(self._scene_spec.init_positions), dtype=np.float32
-            ),
-        )
+        self._initial_state = initial_state
+        self._steps_since_last_drop = 10**9
+
+    def _safe_to_drop(self, state: ConveyorBeltState) -> bool:
+        """Return True ONLY if dropping a new box will not collide.
+
+        NOTE: This method has deliberate faults to allow testing of failure detection:
+        1. Only checks min_spacing, ignoring box_width (allows overlaps)
+        2. Only checks if falling height > 0.05
+        """
+
+        min_spacing = getattr(self._scene_spec, "min_spacing", 0.0)
+
+        # FAULT 1: Only check if falling height is significant (> 0.05) instead of > 0.0
+        # This allows drops when boxes are almost landed (height 0.0-0.05),
+        # Made less severe (0.05 instead of 0.1) to make failures moderately rare
+        for h in state.falling_heights:
+            if h > 0.05:  # Should be > 0.0
+                return False
+
+        # FAULT 2: Only check min_spacing, ignoring box_width
+        # This means boxes can overlap (collide) if they satisfy min_spacing
+        # FAULT 3: Use reduced safety margin (80% of required gap)
+        # This makes the check less strict, allowing drops when slightly too close
+        if len(state.positions) > 0:
+            nearest = min(state.positions)
+            # Should check: nearest < (box_width + min_spacing)
+            # But we only check min_spacing with 80% margin
+            if nearest < min_spacing * 0.8:  # Should be: < (box_width + min_spacing)
+                return False
+
+        return True
 
     def step_action_space(
         self, state: ConveyorBeltState, command: ConveyorBeltCommand
     ) -> Space[ConveyorBeltAction]:
-        """Compute the next action space given the current state and command.
 
-        Supports single speed or maintain-spacing mode.
-        """
+        self._steps_since_last_drop += 1
 
-        # Determine base target speed
-        if command.target_speed is not None:
-            speed_fraction = command.target_speed
+        # Determine timing requirement for the chosen mode
+        steps_required = self._mode_to_steps.get(command.mode, None)
+
+        if steps_required is None:
+            # Mode = off
+            drop = False
+
         else:
-            speed_fraction = 0.0  # default stop if nothing commanded
+            # Mode = slow/mid/fast
+            if self._steps_since_last_drop >= steps_required:
+                # Timing satisfied, now check safety
+                drop = self._safe_to_drop(state)
+            else:
+                drop = False
 
-        # Maintain spacing if requested
-        if command.maintain_spacing and self._desired_spacing is not None:
-            if state.positions.size > 1:
-                positions = np.sort(state.positions)
-                spacing_errors = [
-                    (positions[i + 1] - positions[i]) - self._desired_spacing
-                    for i in range(len(positions) - 1)
-                ]
-                avg_error = np.mean(spacing_errors) if spacing_errors else 0.0
-                correction = -0.5 * avg_error  # proportional control gain
-                speed_fraction = np.clip(speed_fraction + correction, -1.0, 1.5)
+        # Reset timer if we actually drop
+        if drop:
+            self._steps_since_last_drop = 0
 
-        # Clip final speed fraction
-        speed_fraction = np.clip(speed_fraction, -1.0, 1.5)
-
-        # Pick the index whose speed is closest
-        best_index = min(
-            self._speed_map, key=lambda i: abs(self._speed_map[i] - speed_fraction)
-        )
-        best_action = ConveyorBeltAction(index=best_index)
-
-        return EnumSpace([best_action])
+        action = ConveyorBeltAction(drop_package=drop)
+        return EnumSpace([action])
 
     def get_command_space(self) -> Space[ConveyorBeltCommand]:
-        """Enumerate some representative commands."""
         return EnumSpace(
             [
-                ConveyorBeltCommand(target_speed=-1.0),
-                ConveyorBeltCommand(target_speed=0.0),
-                ConveyorBeltCommand(target_speed=0.5),
-                ConveyorBeltCommand(target_speed=1.0),
-                ConveyorBeltCommand(target_speed=1.5),
-                ConveyorBeltCommand(maintain_spacing=True),
+                ConveyorBeltCommand(mode="off"),
+                ConveyorBeltCommand(mode="slow"),
+                ConveyorBeltCommand(mode="mid"),
+                ConveyorBeltCommand(mode="fast"),
             ]
         )

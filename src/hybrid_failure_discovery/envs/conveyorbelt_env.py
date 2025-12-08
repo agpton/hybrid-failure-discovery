@@ -1,5 +1,6 @@
 """This module defines the ConveyorBeltEnv environment for simulating a 1D
-conveyor belt with loading and shifting actions."""
+conveyor belt with packages that drop onto the conveyer belt at controllable
+times."""
 
 from dataclasses import dataclass
 
@@ -17,78 +18,57 @@ from hybrid_failure_discovery.envs.constraint_based_env_model import (
 
 @dataclass(frozen=True)
 class ConveyorBeltState:
-    """A state in the conveyor belt environment."""
+    """A state in the conveyer belt environment."""
 
-    positions: NDArray[np.float32]
-    velocities: NDArray[np.float32]
+    positions: NDArray[np.float32]  # positions of packages on the conveyer belt
     falling_heights: NDArray[np.float32]  # height above belt (0 if on belt)
+    step_count: int  # number of steps elapsed, mainly for visualization
 
 
 @dataclass(frozen=True)
 class ConveyorBeltAction:
-    """An action in the conveyor belt environment."""
+    """An action in the conveyer belt environment."""
 
-    index: int
+    drop_package: bool  # whether to drop a new package at the current time step
 
 
 @dataclass(frozen=True)
 class ConveyorBeltSceneSpec:
-    """Static hyperparameters for the conveyor belt environment."""
+    """A spec for the conveyer belt environment."""
 
-    init_velocities: tuple[float, float, float, float, float, float] = (
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-    )
-    init_positions: tuple[float, float, float, float, float, float] = (
-        0.5,
-        1.25,
-        2.0,
-        2.75,
-        3.5,
-        4.25,
-    )
+    conveyor_belt_velocity: float = 1.0
     dt: float = 0.01
     belt_length: float = 5.0
     box_width: float = 0.4
     box_height: float = 0.5
     gravity: float = 9.81
-    drop_start_height: float = 1.0  # height from which boxes start dropping
-    min_spacing: float = 0.72  # minimal spacing between boxes to consider "free space"
+    drop_start_height: float = 1.0
+    initial_drop_position: float = 0.0
 
 
 class ConveyorBeltEnv(ConstraintBasedGymEnv[ConveyorBeltState, ConveyorBeltAction]):
-    """A 1D conveyor belt environment."""
+    """1D conveyor belt environment with external control for dropping
+    packages."""
 
-    metadata = {"render_modes": ["rgb_array"], "render_fps": 10}
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
 
     def __init__(
         self,
         render_mode: str = "rgb_array",
         scene_spec: ConveyorBeltSceneSpec = ConveyorBeltSceneSpec(),
         seed: int = 0,
-        auto_drop: bool = True,
-    ) -> None:
+    ):
         self.scene_spec = scene_spec
         self.render_mode = render_mode
-        self.observation_dim = 6
-        self.auto_drop = auto_drop
 
-        self.action_dim = 5
-        self.box_count = 6
-        super().__init__(seed)
         self._rng = np.random.default_rng(seed)
-        self._step_count = 0
+
+        super().__init__(seed)
 
     def _create_action_space(self) -> FunctionalSpace[ConveyorBeltAction]:
         return FunctionalSpace(
             contains_fn=lambda x: isinstance(x, ConveyorBeltAction),
-            sample_fn=lambda rng: ConveyorBeltAction(
-                index=rng.integers(0, self.action_dim)
-            ),
+            sample_fn=lambda rng: ConveyorBeltAction(drop_package=bool(rng.choice(2))),
         )
 
     def _get_obs(self) -> ConveyorBeltState:
@@ -99,13 +79,9 @@ class ConveyorBeltEnv(ConstraintBasedGymEnv[ConveyorBeltState, ConveyorBeltActio
         return EnumSpace(
             [
                 ConveyorBeltState(
-                    positions=np.array(
-                        self.scene_spec.init_positions, dtype=np.float32
-                    ),
-                    velocities=np.array(
-                        self.scene_spec.init_velocities, dtype=np.float32
-                    ),
-                    falling_heights=np.zeros(self.box_count, dtype=np.float32),
+                    positions=np.array([]),  # empty conveyor belt to start
+                    falling_heights=np.array([]),
+                    step_count=0,
                 )
             ]
         )
@@ -113,72 +89,53 @@ class ConveyorBeltEnv(ConstraintBasedGymEnv[ConveyorBeltState, ConveyorBeltActio
     def get_next_states(
         self, state: ConveyorBeltState, action: ConveyorBeltAction
     ) -> EnumSpace[ConveyorBeltState]:
+        # Get values from scene spec
         dt = self.scene_spec.dt
         gravity = self.scene_spec.gravity
         belt_length = self.scene_spec.belt_length
         box_width = self.scene_spec.box_width
         drop_start_height = self.scene_spec.drop_start_height
-        min_spacing = self.scene_spec.min_spacing
-
-        speed_map = {
-            0: -1.0,  # reverse
-            1: 0.0,  # stop
-            2: 0.5,  # slow
-            3: 1.0,  # normal
-            4: 1.5,  # fast
-        }
-        new_speed = speed_map[action.index]
+        initial_drop_position = self.scene_spec.initial_drop_position
 
         positions = list(state.positions)
-        velocities = list(np.full_like(state.velocities, new_speed))
-        falling_heights = list(state.falling_heights.copy())
+        falling_heights = list(state.falling_heights)
 
-        # Update falling heights (simulate falling boxes)
+        # Update falling heights
         for i in range(len(falling_heights)):
             if falling_heights[i] > 0:
                 falling_heights[i] -= gravity * dt
                 if falling_heights[i] <= 0:
                     falling_heights[i] = 0.0
 
-        # Predict positions after movement for non-falling boxes
+        # Predict positions for non-falling boxes
         predicted_positions = []
-        for p, v, h in zip(positions, velocities, falling_heights, strict=True):
+        for p, h in zip(positions, falling_heights, strict=True):
             if h > 0.0:
-                predicted_positions.append(p)  # falling boxes don't move horizontally
+                predicted_positions.append(p)
             else:
+                v = self.scene_spec.conveyor_belt_velocity
                 predicted_positions.append(p + v * dt)
 
-        # Now check if it's safe to drop a new box at 0 based on predicted positions
-        if self.auto_drop:
-            candidate_positions = predicted_positions + [0.0]
-            candidate_positions_sorted = sorted(candidate_positions)
-            diffs = np.diff(candidate_positions_sorted)
-            tolerance = 0.02
-            if len(diffs) == 0 or all(d + tolerance >= min_spacing for d in diffs):
-                positions.append(0.0)
-                velocities.append(new_speed)
-                falling_heights.append(drop_start_height)
+        # Drop a new package if the action is drop
+        if action.drop_package:
+            # Create a new package!
+            predicted_positions.append(initial_drop_position)
+            falling_heights.append(drop_start_height)
 
-                # Update predicted_positions to include the new box at 0
-                predicted_positions.append(0.0)
-
-        # Remove boxes that have fallen off the belt after movement
-        removed = 0
-        keep_pos, keep_vel, keep_fall = [], [], []
-        for p, v, h in zip(predicted_positions, velocities, falling_heights):
+        # Remove boxes that have fallen off the belt
+        keep_pos, keep_fall = [], []
+        for p, h in zip(predicted_positions, falling_heights, strict=True):
             if (p >= belt_length - box_width) or (p < 0):
-                removed += 1
                 continue
             keep_pos.append(p)
-            keep_vel.append(v)
             keep_fall.append(h)
 
         return EnumSpace(
             [
                 ConveyorBeltState(
                     positions=np.array(keep_pos, dtype=np.float32),
-                    velocities=np.array(keep_vel, dtype=np.float32),
                     falling_heights=np.array(keep_fall, dtype=np.float32),
+                    step_count=state.step_count + 1,
                 )
             ]
         )
@@ -186,7 +143,7 @@ class ConveyorBeltEnv(ConstraintBasedGymEnv[ConveyorBeltState, ConveyorBeltActio
     def actions_are_equal(
         self, action1: ConveyorBeltAction, action2: ConveyorBeltAction
     ) -> bool:
-        return action1.index == action2.index
+        return action1.drop_package == action2.drop_package
 
     def _get_reward_and_termination(
         self,
@@ -256,7 +213,7 @@ class ConveyorBeltEnv(ConstraintBasedGymEnv[ConveyorBeltState, ConveyorBeltActio
         roller_radius = 0.05
         roller_spacing = 1.0
         roller_count = int(np.ceil(belt_length / roller_spacing)) + 1
-        time_elapsed = self._step_count * self.scene_spec.dt
+        time_elapsed = state.step_count * self.scene_spec.dt
         angular_speed = 2 * np.pi
         angle = -(time_elapsed * angular_speed) % (2 * np.pi)
 
@@ -297,11 +254,16 @@ class ConveyorBeltEnv(ConstraintBasedGymEnv[ConveyorBeltState, ConveyorBeltActio
                 lw=0.5,
             )
 
-        def draw_3d_box(x: float, height: float, value: float):
+        def draw_3d_box(x: float, height: float, value: float | None = None):
             width, box_height = self.scene_spec.box_width, self.scene_spec.box_height
             color_min, color_max = -1.5, 1.5
-            normalized = np.clip((value - color_min) / (color_max - color_min), 0, 1)
-            base_color = plt.get_cmap("viridis")(normalized)
+            if value is not None:
+                normalized = np.clip(
+                    (value - color_min) / (color_max - color_min), 0, 1
+                )
+                base_color = plt.get_cmap("viridis")(normalized)
+            else:
+                base_color = plt.get_cmap("viridis")(0.5)
 
             top_rgb = np.minimum(np.array(base_color[:3]) * 1.3, 1.0)
             side_rgb = np.array(base_color[:3]) * 0.7
@@ -336,27 +298,29 @@ class ConveyorBeltEnv(ConstraintBasedGymEnv[ConveyorBeltState, ConveyorBeltActio
             )
             ax.add_patch(side_face)
 
-            ax.text(
-                x + width / 2,
-                y + box_height / 2,
-                f"{value:.1f}",
-                ha="center",
-                va="center",
-                color="white" if value > 0.5 else "black",
-                zorder=5,
-            )
+            if value is not None:
+                ax.text(
+                    x + width / 2,
+                    y + box_height / 2,
+                    f"{value:.1f}",
+                    ha="center",
+                    va="center",
+                    color="white" if value > 0.5 else "black",
+                    zorder=5,
+                )
 
-        for pos, height, vel in zip(
-            state.positions, state.falling_heights, state.velocities
+        for pos, height in zip(
+            state.positions,
+            state.falling_heights,
+            strict=True,
         ):
             if pos < 0 or pos > self.scene_spec.belt_length:
                 print(f"  Skipping box out of belt bounds: pos={pos}")
                 continue
-            draw_3d_box(pos, height, vel)
+            draw_3d_box(pos, height)
 
         plt.tight_layout()
         image = fig2data(fig)
         plt.close(fig)
 
-        self._step_count += 1
         return image  # type: ignore
